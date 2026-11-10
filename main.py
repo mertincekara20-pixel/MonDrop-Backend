@@ -1,6 +1,6 @@
 import asyncio, ipaddress, os, re, socket, tempfile
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 import aiohttp
 from aiohttp.abc import AbstractResolver
 from fastapi import FastAPI, HTTPException
@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-app=FastAPI(title='MonDrop API',version='3.0')
+app=FastAPI(title='MonDrop API',version='4.0')
 origins=[x.strip() for x in os.getenv('ALLOWED_ORIGINS','').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware,allow_origins=origins,allow_methods=['GET','POST'],allow_headers=['Content-Type'],expose_headers=['Content-Disposition','Content-Length'])
 MAX_BYTES=100*1024*1024
@@ -39,15 +39,71 @@ def check_url(url):
     return p
 
 @app.get('/')
-def root(): return {'service':'MonDrop API','status':'online','version':'3.0'}
+def root(): return {'service':'MonDrop API','status':'online','version':'4.0'}
 @app.get('/health')
 def health(): return {'ok':True}
+
+def youtube_video_id(url):
+    """Accept only known YouTube hosts and canonical video-ID URL forms."""
+    p=urlsplit(url)
+    host=(p.hostname or '').lower().rstrip('.')
+    parts=[x for x in p.path.split('/') if x]
+    video_id=None
+    if host in ('youtu.be','www.youtu.be') and len(parts)==1:
+        video_id=parts[0]
+    elif host in ('youtube.com','www.youtube.com','m.youtube.com','music.youtube.com'):
+        if parts==['watch']:
+            video_id=parse_qs(p.query).get('v',[None])[0]
+        elif len(parts)==2 and parts[0] in ('shorts','live','embed'):
+            video_id=parts[1]
+    if video_id and re.fullmatch(r'[A-Za-z0-9_-]{11}',video_id):
+        return video_id
+    return None
+
+async def download_youtube(req):
+    video_id=youtube_video_id(req.url)
+    if not video_id:
+        raise HTTPException(422,'Geçerli bir YouTube video bağlantısı girin.')
+    temp=tempfile.TemporaryDirectory(prefix='mondrop-yt-')
+    base=Path(temp.name)
+    target=base/('MonDrop.'+req.format)
+    # No cookies, login, proxies, or access-control circumvention.
+    canonical='https://www.youtube.com/watch?v='+video_id
+    args=['yt-dlp','--no-playlist','--no-warnings','--no-progress',
+          '--no-cache-dir','--socket-timeout','15','--retries','1',
+          '--max-filesize','90M','--match-filter','duration <= 1200',
+          '--output',str(base/'MonDrop.%(ext)s')]
+    if req.format=='mp3':
+        args+=['--format','bestaudio/best','--extract-audio','--audio-format','mp3','--audio-quality','192K']
+    else:
+        args+=['--format','bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+               '--merge-output-format','mp4','--recode-video','mp4']
+    args.append(canonical)
+    try:
+        async with slots:
+            proc=await asyncio.create_subprocess_exec(*args,stdout=asyncio.subprocess.DEVNULL,stderr=asyncio.subprocess.PIPE)
+            try:
+                _,stderr=await asyncio.wait_for(proc.communicate(),timeout=175)
+            except asyncio.TimeoutError:
+                proc.kill();await proc.communicate()
+                raise HTTPException(504,'İşlem zaman aşımına uğradı. Daha kısa bir video deneyin.')
+            if proc.returncode!=0 or not target.is_file():
+                raise HTTPException(422,'YouTube bu videonun indirilmesine izin vermedi veya sunucu videoyu işleyemedi.')
+            if target.stat().st_size>MAX_BYTES:
+                raise HTTPException(413,'Çıktı 100 MB sınırını aşıyor.')
+        return FileResponse(target,media_type='audio/mpeg' if req.format=='mp3' else 'video/mp4',
+                            filename='MonDrop.'+req.format,background=BackgroundTask(temp.cleanup))
+    except Exception:
+        temp.cleanup()
+        raise
 
 @app.post('/download')
 async def download(req:Request):
     p=check_url(req.url)
     if req.format not in ('mp3','mp4'): raise HTTPException(400,'Geçersiz format.')
-    # Reject known platform page URLs: no attempt to bypass their download restrictions.
+    if youtube_video_id(req.url):
+        return await download_youtube(req)
+    # Other platform pages are not supported.
     host=p.hostname.lower()
     if any(host==d or host.endswith('.'+d) for d in ('youtube.com','youtu.be','instagram.com','tiktok.com','facebook.com','vimeo.com','twitter.com','x.com')):
         raise HTTPException(422,'Platform sayfaları desteklenmiyor; doğrudan ve izinli medya dosyası bağlantısı kullanın.')
