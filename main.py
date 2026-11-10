@@ -1,4 +1,4 @@
-import asyncio, ipaddress, os, re, socket, tempfile
+import asyncio, ipaddress, logging, os, re, socket, tempfile
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 import aiohttp
@@ -9,7 +9,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-app=FastAPI(title='MonDrop API',version='4.0')
+logger=logging.getLogger('uvicorn.error')
+app=FastAPI(title='MonDrop API',version='4.0-debug')
 origins=[x.strip() for x in os.getenv('ALLOWED_ORIGINS','').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware,allow_origins=origins,allow_methods=['GET','POST'],allow_headers=['Content-Type'],expose_headers=['Content-Disposition','Content-Length'])
 MAX_BYTES=100*1024*1024
@@ -88,6 +89,9 @@ async def download_youtube(req):
                 proc.kill();await proc.communicate()
                 raise HTTPException(504,'İşlem zaman aşımına uğradı. Daha kısa bir video deneyin.')
             if proc.returncode!=0 or not target.is_file():
+                error_text=stderr.decode('utf-8',errors='replace')[-3500:]
+                error_text=error_text.replace(canonical,'[youtube-url]')
+                logger.error('MonDrop yt-dlp failed: returncode=%s, output_exists=%s, stderr=%s',proc.returncode,target.is_file(),error_text)
                 raise HTTPException(422,'YouTube bu videonun indirilmesine izin vermedi veya sunucu videoyu işleyemedi.')
             if target.stat().st_size>MAX_BYTES:
                 raise HTTPException(413,'Çıktı 100 MB sınırını aşıyor.')
